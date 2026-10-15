@@ -31,7 +31,7 @@ def start_dummy_server():
 threading.Thread(target=start_dummy_server, daemon=True).start()
 
 from pyrogram import Client, filters
-from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, ChatPrivileges, ChatPermissions
+from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, ChatPrivileges, ChatPermissions, ChatMemberUpdated, CallbackQuery
 from pyrogram.errors import ChatAdminRequired, RPCError
 from pyrogram.raw import functions
 
@@ -43,13 +43,22 @@ OWNER_ID = int(os.environ.get("OWNER_ID", "123456789"))
 
 app = Client("bio_guard_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
-# --- TRACK LAST BOT WARNING MESSAGE PER GROUP ---
+# --- TRACK LAST BOT WARNING MESSAGE PER GROUP & OWNER STATES ---
 last_bot_msg = {}
+owner_states = {}
 
 # --- HELPER FOR GLOBAL BUTTON ---
 def get_protect_btn(client: Client):
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("Protect your group 🛡", url=f"https://t.me/{client.me.username}?startgroup=true")]
+    ])
+
+# --- HELPER FOR OWNER PANEL BUTTONS ---
+def get_owner_panel_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📋 Managed Groups & Links", callback_data="owner_groups")],
+        [InlineKeyboardButton("👑 Promote Admin in Group", callback_data="owner_promote_select")],
+        [InlineKeyboardButton("🚀 Broadcast Message", callback_data="owner_broadcast_prompt")]
     ])
 
 # --- HELPER FOR FORMATTING WARNING / ACTION MESSAGES ---
@@ -236,6 +245,19 @@ async def delete_previous_bot_msg(chat_id: int):
         except Exception:
             pass
 
+# --- AUTOMATIC GROUP TRACKER ---
+@app.on_my_chat_member()
+async def track_bot_chats(client: Client, update: ChatMemberUpdated):
+    chat = update.chat
+    if update.new_chat_member:
+        status = update.new_chat_member.status
+        st_val = status.value if hasattr(status, "value") else str(status)
+        if st_val in ["member", "administrator"]:
+            save_or_update_group(chat.id, chat.title, chat.username)
+        elif st_val in ["left", "banned"]:
+            cursor.execute("DELETE FROM groups WHERE chat_id = ?", (chat.id,))
+            conn.commit()
+
 # --- ADMIN PERMISSION CHECKER ---
 async def check_bot_admin_rights(client: Client, chat_id: int):
     try:
@@ -283,6 +305,14 @@ async def process_violation(client: Client, message: Message, user, reason: str,
 # --- COMMAND: /start & /help ---
 @app.on_message(filters.command(["start", "help"]))
 async def start_command(client: Client, message: Message):
+    # Agar owner private chat me hai to control panel buttons dikhayein
+    if message.from_user and message.from_user.id == OWNER_ID and message.chat.type.value == "private":
+        panel_text = (
+            f"👑 **Welcome Owner!**\n\n"
+            f"Yeh aapka advanced bot management dashboard hai. Niche diye gaye buttons se aap apne groups manage kar sakte hain, admin promote kar sakte hain, ya broadcast bhej sakte hain."
+        )
+        return await message.reply_text(panel_text, reply_markup=get_owner_panel_keyboard())
+
     protect_btn = get_protect_btn(client)
     bot_username = client.me.username
 
@@ -313,6 +343,135 @@ async def start_command(client: Client, message: Message):
         f"/autodelete - Auto delete messages timer setting."
     )
     await message.reply_text(start_text, reply_markup=protect_btn, disable_web_page_preview=True)
+
+
+# --- OWNER PANEL BUTTON CALLBACK HANDLER ---
+@app.on_callback_query(filters.user(OWNER_ID))
+async def owner_panel_callbacks(client: Client, callback_query: CallbackQuery):
+    data = callback_query.data
+    
+    if data == "owner_groups":
+        groups = get_all_groups_details()
+        if not groups:
+            return await callback_query.answer("No registered groups found!", show_alert=True)
+
+        out = "📋 **Managed Network Groups & Links**\n───•────────────────•───\n\n"
+        for chat_id, title, username in groups:
+            if username:
+                link = f"https://t.me/{username}"
+            else:
+                chat_str = str(chat_id)
+                if chat_str.startswith("-100"):
+                    link = f"https://t.me/c/{chat_str[4:]}/1"
+                elif chat_str.startswith("-"):
+                    link = f"https://t.me/c/{chat_str[1:]}/1"
+                else:
+                    link = f"https://t.me/{chat_id}"
+
+            out += f"• **{title or 'Group'}**\n   🔗 {link}\n\n"
+
+        out += f"📊 **Total Groups:** `{len(groups)}`"
+        await callback_query.message.edit_text(out[:4000], reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("« Back to Panel", callback_data="owner_back")]]), disable_web_page_preview=True)
+        await callback_query.answer()
+
+    elif data == "owner_promote_select":
+        groups = get_all_groups_details()
+        if not groups:
+            return await callback_query.answer("No groups found where bot is active!", show_alert=True)
+
+        buttons = []
+        for chat_id, title, _ in groups:
+            buttons.append([InlineKeyboardButton(f"👥 {title or 'Group'}", callback_data=f"sel_grp_{chat_id}")])
+        buttons.append([InlineKeyboardButton("« Back to Panel", callback_data="owner_back")])
+
+        await callback_query.message.edit_text("👑 **Select the group where you want to promote an admin:**", reply_markup=InlineKeyboardMarkup(buttons))
+        await callback_query.answer()
+
+    elif data.startswith("sel_grp_"):
+        chat_id = int(data.split("_")[2])
+        owner_states[callback_query.from_user.id] = {"action": "promote_user", "chat_id": chat_id}
+        await callback_query.message.edit_text(
+            "👤 **Group Selected!**\n\nAb aap mujhe us user ka **Username** (jaise `@username`) ya **User ID** bhejiye jise aap is group me admin banana chahte hain.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data="owner_back")]])
+        )
+        await callback_query.answer()
+
+    elif data == "owner_broadcast_prompt":
+        owner_states[callback_query.from_user.id] = {"action": "broadcast_msg"}
+        await callback_query.message.edit_text(
+            "🚀 **Broadcast Mode Activated**\n\nAb aap jo bhi message yahan **bhejenge** ya **reply karenge**, woh sabhi groups me broadcast ho jayega.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data="owner_back")]])
+        )
+        await callback_query.answer()
+
+    elif data == "owner_back":
+        if callback_query.from_user.id in owner_states:
+            del owner_states[callback_query.from_user.id]
+        await callback_query.message.edit_text("👑 **Owner Control Panel**\n\nChoose an action below:", reply_markup=get_owner_panel_keyboard())
+        await callback_query.answer()
+
+
+# --- HANDLE OWNER INTERACTIVE TEXT INPUT FOR PROMOTION & BROADCAST ---
+@app.on_message(filters.user(OWNER_ID) & filters.private & ~filters.command(["start", "help"]))
+async def handle_owner_interactive_input(client: Client, message: Message):
+    user_id = message.from_user.id
+    if user_id not in owner_states:
+        return
+
+    state = owner_states[user_id]
+    action = state.get("action")
+
+    if action == "promote_user":
+        chat_id = state["chat_id"]
+        target_input = message.text.strip()
+        
+        status_msg = await message.reply_text("🔄 Processing promotion...")
+        try:
+            target_user = await client.get_users(parse_target(target_input))
+            chat = await client.get_chat(chat_id)
+
+            await client.promote_chat_member(
+                chat_id=chat.id,
+                user_id=target_user.id,
+                privileges=ChatPrivileges(
+                    can_change_info=True,
+                    can_delete_messages=True,
+                    can_restrict_members=True,
+                    can_invite_users=True,
+                    can_pin_messages=True,
+                    can_manage_video_chats=True,
+                    can_promote_members=False
+                )
+            )
+            del owner_states[user_id]
+            await status_msg.edit_text(
+                f"✅ **Successfully Promoted {target_user.mention} as Admin in {chat.title}!**",
+                reply_markup=get_owner_panel_keyboard()
+            )
+        except Exception as e:
+            await status_msg.edit_text(f"❌ Failed to promote: `{e}`\n\nPlease try again or click cancel.", reply_markup=get_owner_panel_keyboard())
+
+    elif action == "broadcast_msg":
+        groups = get_all_groups_details()
+        success, failed = 0, 0
+        status = await message.reply_text("🚀 Broadcasting message to all groups...")
+
+        for chat_id, _, _ in groups:
+            try:
+                if message.reply_to_message:
+                    await message.reply_to_message.copy(chat_id)
+                else:
+                    await client.send_message(chat_id, message.text)
+                success += 1
+                await asyncio.sleep(0.5)
+            except Exception:
+                failed += 1
+
+        del owner_states[user_id]
+        await status.edit_text(
+            f"📢 **Broadcast Finished Successfully!**\n\n✅ Delivered: `{success}` | ❌ Failed: `{failed}`",
+            reply_markup=get_owner_panel_keyboard()
+        )
 
 
 # --- GROUP COMMAND: /status ---
@@ -353,7 +512,7 @@ async def group_status(client: Client, message: Message):
         f"{icon(s['nolinks'])} Links filter `/nolinks`\n"
         f"{icon(s['forward_protect'])} Forwards filter `/noforwards`\n"
         f"{icon(s['nolocations'])} Locations filter `/nolocations`\n"
-        f"{icon(s['nocontacts'])} Contacts filter `/nolocations`\n"
+        f"{icon(s['nocontacts'])} Contacts filter `/nocontacts`\n"
         f"{icon(s['nocommands'])} Commands filter `/nocommands`\n"
         f"{icon(s['nohashtags'])} Hashtags filter `/nohashtags`\n"
         f"{icon(s['novoice'])} Voice filter `/novoice`\n"
@@ -708,14 +867,12 @@ async def handle_service_messages(client: Client, message: Message):
     chat_id = message.chat.id
     settings = get_group_settings(chat_id)
 
-    # 1. NO EVENTS (JOIN/LEFT MESSAGES)
     if settings["noevents"] == 1:
         try:
             await message.delete()
         except Exception:
             pass
 
-    # 2. NO BOTS (KICK ADDED SPAMBOTS)
     if settings["nobots"] == 1 and message.new_chat_members:
         for new_mem in message.new_chat_members:
             if new_mem.is_bot and new_mem.id != client.me.id:
@@ -760,7 +917,7 @@ async def handle_group_message(client: Client, message: Message):
 
     settings = get_group_settings(chat_id)
 
-    # 1. FORWARD PROTECTION (WARNING + AUTO MUTE ON 3/3)
+    # 1. FORWARD PROTECTION
     is_forwarded = bool(message.forward_date or message.forward_from or message.forward_from_chat or message.forward_sender_name)
     if settings["forward_protect"] == 1 and is_forwarded:
         return await process_violation(
@@ -874,78 +1031,6 @@ async def handle_group_message(client: Client, message: Message):
         asyncio.create_task(delete_after_delay(chat_id, message.id, del_sec))
 
 
-# --- HIDDEN OWNER COMMANDS ---
-@app.on_message(filters.user(OWNER_ID) & filters.command("adminb"))
-async def promote_user_owner(client: Client, message: Message):
-    protect_btn = get_protect_btn(client)
-    if len(message.command) < 3:
-        return await message.reply_text("💡 **Usage:** `/adminb <group_link_or_id> <user_username_or_id>`", reply_markup=protect_btn)
-
-    status_msg = await message.reply_text("🔄 Processing promotion...", reply_markup=protect_btn)
-    try:
-        chat = await client.get_chat(parse_target(message.command[1]))
-        user = await client.get_users(parse_target(message.command[2]))
-
-        await client.promote_chat_member(
-            chat_id=chat.id,
-            user_id=user.id,
-            privileges=ChatPrivileges(
-                can_change_info=True,
-                can_delete_messages=True,
-                can_restrict_members=True,
-                can_invite_users=True,
-                can_pin_messages=True,
-                can_manage_video_chats=True,
-                can_promote_members=False
-            )
-        )
-        await status_msg.edit_text(f"✅ **Promoted {user.mention} as Admin in {chat.title}!**", reply_markup=protect_btn)
-    except Exception as e:
-        await status_msg.edit_text(f"❌ Failed: `{e}`", reply_markup=protect_btn)
-
-
-@app.on_message(filters.user(OWNER_ID) & filters.command(["groups", "stats"]))
-async def bot_groups_analytics(client: Client, message: Message):
-    protect_btn = get_protect_btn(client)
-    status_msg = await message.reply_text("📊 Fetching group statistics...", reply_markup=protect_btn)
-    groups = get_all_groups_details()
-
-    if not groups:
-        return await status_msg.edit_text("ℹ️ No registered groups found.", reply_markup=protect_btn)
-
-    out = "📋 **Managed Network Groups**\n───•────────────────•───\n\n"
-    for chat_id, title, username in groups:
-        link = f"https://t.me/{username}" if username else f"ID: `{chat_id}`"
-        out += f"• **{title or 'Group'}** | {link}\n"
-
-    out += f"\n📊 **Total Groups:** `{len(groups)}`"
-    await status_msg.edit_text(out[:4000], reply_markup=protect_btn, disable_web_page_preview=True)
-
-
-@app.on_message(filters.user(OWNER_ID) & filters.command("broadcast"))
-async def broadcast_msg(client: Client, message: Message):
-    protect_btn = get_protect_btn(client)
-    if not message.reply_to_message and len(message.command) < 2:
-        return await message.reply_text("💡 Reply to a message or type `/broadcast <text>`.", reply_markup=protect_btn)
-
-    groups = get_all_groups_details()
-    success, failed = 0, 0
-    status = await message.reply_text("🚀 Broadcasting...", reply_markup=protect_btn)
-
-    for chat_id, _, _ in groups:
-        try:
-            if message.reply_to_message:
-                await message.reply_to_message.copy(chat_id)
-            else:
-                await client.send_message(chat_id, message.text.split(None, 1)[1])
-            success += 1
-            await asyncio.sleep(0.5)
-        except Exception:
-            failed += 1
-
-    await status.edit_text(f"📢 **Broadcast Finished**\n✅ Delivered: `{success}` | ❌ Failed: `{failed}`", reply_markup=protect_btn)
-
-
 if __name__ == "__main__":
-    print("Bot starting successfully...")
+    print("Advanced Protection Bot starting successfully...")
     app.run()
